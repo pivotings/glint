@@ -1,0 +1,15 @@
+name: glint
+version: 0.1.0
+description: Git Log Intelligence - GitHub OSINT tool for analyzing commit history and user activity
+
+authors:
+  - pivotings 
+
+repository: https://github.com/pivotings/glint
+license: MIT
+
+crystal: ">= 1.10.0"
+
+targets:
+  glint:
+    main: src/glint.cr

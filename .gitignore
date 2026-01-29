@@ -1,0 +1,11 @@
+/docs/
+/lib/
+/bin/
+/.shards/
+*.dwarf
+
+# Debug files
+*.log
+
+# Binary
+/glint
