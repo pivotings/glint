@@ -6,8 +6,12 @@ module Glint
 
     parser = OptionParser.new do |p|
       p.banner = "glint - GitHub OSINT tool\n\nUsage: glint [options] <username|email>"
+      p.banner = "glint - GitHub OSINT tool\n\nUsage: glint [options] <username|email>\n       glint -l <file> -o <dir> [options]"
 
       p.on("-t TOKEN", "--token=TOKEN", "GitHub personal access token") { |t| config.token = t }
+      p.on("-l FILE", "--list=FILE", "File containing list of emails/usernames (one per line)") { |f| config.list_file = f }
+      p.on("-o DIR", "--output-dir=DIR", "Output directory for batch results") { |d| config.output_dir = d }
+      p.on("-c N", "--concurrent=N", "Number of concurrent workers (default: 4)") { |n| config.concurrent = n.to_i32 }
       p.on("-d", "--details", "Show detailed commit info") { config.details = true }
       p.on("-s", "--secrets", "Scan for secrets in commits") { config.secrets = true }
       p.on("-i", "--interesting", "Show interesting strings") { config.interesting = true }
@@ -31,12 +35,19 @@ module Glint
 
     parser.parse
 
-    target = ARGV.first?
-    unless target
-      puts parser
-      exit 1
+    if config.batch_mode?
+      if config.output_dir.empty?
+        puts parser
+        exit 1
+      end
+    else
+      target = ARGV.first?
+      unless target
+        puts parser
+        exit 1
+      end
+      config.target = target
     end
-    config.target = target
 
     if config.token.empty?
       result = Token.detect

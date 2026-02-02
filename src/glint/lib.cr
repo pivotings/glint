@@ -14,9 +14,92 @@ require "./token"
 module Glint
   VERSION = "0.1.0"
 
+  class ResultsStore
+    def initialize(@output_dir : String, @config : Config)
+      Dir.mkdir_p(@output_dir) unless Dir.exists?(@output_dir)
+    end
+
+    def save_result(target : String, result : Hash(String, Models::EmailDetails), user : Models::User?, is_org : Bool?, error : String?)
+      safe_name = target.gsub(/[^a-zA-Z0-9]/, "_")
+      json_path = File.join(@output_dir, "#{safe_name}.json")
+      txt_path = File.join(@output_dir, "#{safe_name}.txt")
+
+      JSON.build(File.open(json_path)) do |json|
+        json.object do
+          json.field "target", target
+          json.field "timestamp", Time.utc.to_s
+          json.field "error", error if error
+          if user && !error
+            json.field "found", true
+            json.field "is_org", is_org
+            json.field "user" { user.to_json_output(json) }
+            json.field "results" do
+              json.array do
+                result.each do |email, details|
+                  json.object do
+                    json.field "email", email
+                    details.to_json(json)
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+
+      unless error || user.nil?
+        File.open(txt_path, "w") do |f|
+          f.puts "Target: #{target}"
+          f.puts "=" * 50
+          if is_org
+            f.puts "Organization: #{user.login}"
+          else
+            f.puts "User: #{user.login}"
+          end
+          f.puts "Name: #{user.name}" unless user.name.empty?
+          f.puts "Email: #{user.email}" unless user.email.empty?
+          f.puts
+          f.puts "Contributors: #{result.size}"
+          f.puts "-" * 50
+          result.each do |email, details|
+            marker = details.is_target ? "[TARGET]" : (details.is_similar ? "[SIMILAR]" : "")
+            f.puts "#{marker} #{email} (#{details.commit_count} commits)"
+            f.puts "  Names: #{details.names.join(", ")}" unless details.names.empty?
+          end
+        end
+      end
+    end
+
+    def save_summary(summary : Array(Tuple(String, Bool, String?)))
+      summary_path = File.join(@output_dir, "_summary.json")
+      JSON.build(File.open(summary_path)) do |json|
+        json.object do
+          json.field "generated_at", Time.utc.to_s
+          json.field "total_targets", summary.size
+          json.field "successful", summary.count { |_, found, _| found }
+          json.field "failed", summary.count { |_, found, _| !found }
+          json.field "targets" do
+            json.array do
+              summary.each do |target, found, error|
+                json.object do
+                  json.field "target", target
+                  json.field "found", found
+                  json.field "error", error if error
+                end
+              end
+            end
+          end
+        end
+      end
+    end
+  end
+
   class Config
     property token : String = ""
     property target : String = ""
+    property list_file : String = ""
+    property output_dir : String = ""
+    property concurrent : Int32 = 4
     property details : Bool = false
     property secrets : Bool = false
     property interesting : Bool = false
@@ -28,6 +111,10 @@ module Glint
     property quick : Bool = false
     property timestamp_analysis : Bool = false
     property include_forks : Bool = false
+
+    def batch_mode? : Bool
+      !@list_file.empty?
+    end
 
     def output_format : Symbol
       return :json if @json
@@ -43,6 +130,62 @@ module Glint
     end
 
     def run
+      if @config.batch_mode?
+        run_batch
+      else
+        run_single
+      end
+    end
+
+    def run_batch
+      list_path = @config.list_file
+      unless File.exists?(list_path)
+        @display.error("List file not found: #{list_path}")
+        return
+      end
+
+      targets = File.read_lines(list_path).map(&.strip).reject(&.empty?)
+      if targets.empty?
+        @display.error("No targets found in list file")
+        return
+      end
+
+      @display.info("Batch mode: #{targets.size} targets from #{list_path}")
+      @display.info("Output directory: #{@config.output_dir}")
+      @display.info("Concurrent workers: #{@config.concurrent}")
+
+      store = ResultsStore.new(@config.output_dir, @config)
+      channel = Channel(Tuple(String, Bool, String?)).new
+
+      batch_size = ((targets.size + @config.concurrent - 1) / @config.concurrent).to_i32
+      targets.each_slice(batch_size) do |batch|
+        spawn do
+          batch.each do |target|
+            result = process_target(target)
+            channel.send(result)
+          end
+        end
+      end
+
+      completed = 0
+      total = targets.size
+      results = [] of Tuple(String, Bool, String?)
+
+      total.times do
+        result = channel.receive
+        results << result
+        completed += 1
+        @display.progress("Processing: #{completed}/#{total}")
+      end
+
+      store.save_summary(results)
+
+      puts
+      @display.success("Completed #{completed}/#{total} targets")
+      @display.info("Results saved to: #{@config.output_dir}")
+    end
+
+    def run_single
       target = @config.target
       lookup_email = ""
 
@@ -60,7 +203,7 @@ module Glint
             @display.success("Found GitHub account: #{target}")
           else
             @display.error("No GitHub user found for email: #{target}")
-            return
+            return {target, false, "User not found"}
           end
         end
       else
@@ -70,13 +213,13 @@ module Glint
       user = @client.get_user(target)
       unless user
         @display.error("User not found: #{target}")
-        return
+        return {target, false, "User not found"}
       end
 
       is_org = user.type == "Organization"
       @display.user_info(user, is_org)
 
-      return if @config.profile_only
+      return {target, true, nil} if @config.profile_only
 
       repos = if is_org
                 @client.get_org_repos(target, @config.include_forks)
@@ -86,7 +229,7 @@ module Glint
 
       if repos.empty?
         @display.warn("No repositories found")
-        return
+        return {target, true, nil}
       end
 
       @display.info("Found #{repos.size} repositories")
@@ -139,11 +282,118 @@ module Glint
 
       if emails.empty?
         @display.warn("No commits found")
-        return
       end
 
       @display.results(emails, user, is_org, user_identifiers)
       @display.rate_limit(@client.rate_limit)
+      {target, true, nil}
+    end
+
+    private def process_target(target : String) : Tuple(String, Bool, String?)
+      client = GitHub::Client.new(@config.token)
+      display = Display.new(@config)
+
+      lookup_email = ""
+
+      if target.includes?("@")
+        lookup_email = target
+        display.info("Target Email: #{target}")
+        user = client.search_user_by_email(target)
+        if user
+          target = user.login
+          display.success("Found GitHub account: #{target}")
+        else
+          display.warn("Email not public, attempting reverse lookup...")
+          if username = client.resolve_email_by_spoof(target)
+            target = username
+            display.success("Found GitHub account: #{target}")
+          else
+            display.error("No GitHub user found for email: #{target}")
+            return {target, false, "User not found"}
+          end
+        end
+      else
+        display.info("Target Username: #{target}")
+      end
+
+      user = client.get_user(target)
+      unless user
+        display.error("User not found: #{target}")
+        return {target, false, "User not found"}
+      end
+
+      is_org = user.type == "Organization"
+
+      return {target, true, nil} if @config.profile_only
+
+      repos = if is_org
+                client.get_org_repos(target, @config.include_forks)
+              else
+                client.get_user_repos(target, @config.include_forks)
+              end
+
+      if repos.empty?
+        return {target, true, nil}
+      end
+
+      emails = {} of String => Models::EmailDetails
+      user_identifiers = build_user_identifiers(target, lookup_email, user)
+
+      repos.each do |repo|
+        commits = client.get_commits(repo.owner, repo.name, @config.quick)
+
+        is_external_repo = repo.owner.downcase != target.downcase
+
+        commits.each do |commit|
+          if @config.secrets || @config.interesting
+            content = client.get_commit_content(repo.owner, repo.name, commit.hash)
+            unless content.empty?
+              scanner = Scanner.new(@config.secrets, @config.interesting)
+              scanner.scan(content).each do |m|
+                commit.secrets << "#{m.name}: #{m.value}"
+              end
+            end
+          end
+
+          if @config.timestamp_analysis
+            commit.timestamp_analysis = Timestamp.analyze(commit.author_date)
+          end
+
+          email = commit.author_email
+          next if email.empty?
+
+          details = emails[email]? || Models::EmailDetails.new
+          details.names.add(commit.author_name) unless commit.author_name.empty?
+
+          if is_external_repo
+            commit.is_external = true
+            details.external_commits[repo.full_name] ||= [] of Models::CommitInfo
+            details.external_commits[repo.full_name] << commit
+            details.external_commit_count += 1
+          else
+            commit.is_own_repo = true
+            details.commits[repo.full_name] ||= [] of Models::CommitInfo
+            details.commits[repo.full_name] << commit
+            details.own_commit_count += 1
+          end
+
+          details.commit_count += 1
+          details.is_target = user_identifiers.includes?(email.downcase) ||
+                              user_identifiers.includes?(commit.author_name.downcase)
+          emails[email] = details
+        end
+      end
+
+      mark_similar_accounts(emails, user_identifiers)
+
+      if @config.batch_mode? && !@config.output_dir.empty?
+        store = ResultsStore.new(@config.output_dir, @config)
+        store.save_result(target, emails, user, is_org, nil)
+      end
+
+      {target, true, nil}
+    rescue ex
+      {target, false, ex.message}
     end
 
     private def build_user_identifiers(username : String, email : String, user : Models::User) : Set(String)
