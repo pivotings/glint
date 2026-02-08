@@ -22,6 +22,9 @@ jobs:
           - os: macos-14
             target: aarch64-darwin
             binary: glint-macos-arm64
+          - os: windows-latest
+            target: x86_64-windows
+            binary: glint-windows-x86_64.exe
 
     runs-on: ${{ matrix.os }}
     
@@ -36,10 +39,17 @@ jobs:
       - name: Install dependencies
         run: shards install --production
 
-      - name: Build release binary
+      - name: Build release binary (Unix)
+        if: runner.os != 'Windows'
         run: |
           shards build --release --no-debug
           mv bin/glint bin/${{ matrix.binary }}
+
+      - name: Build release binary (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          shards build --release --no-debug
+          move bin\glint.exe bin\${{ matrix.binary }}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -65,8 +75,12 @@ jobs:
           for dir in artifacts/*/; do
             binary=$(basename "$dir")
             cp "$dir/$binary" "release/$binary"
-            chmod +x "release/$binary"
-            cd release && tar czf "$binary.tar.gz" "$binary" && rm "$binary" && cd ..
+            if [[ "$binary" == *.exe ]]; then
+              cd release && zip "${binary%.exe}.zip" "$binary" && rm "$binary" && cd ..
+            else
+              chmod +x "release/$binary"
+              cd release && tar czf "$binary.tar.gz" "$binary" && rm "$binary" && cd ..
+            fi
           done
 
       - name: Create Release
